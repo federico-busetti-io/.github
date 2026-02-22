@@ -1,0 +1,195 @@
+# Reusable workflow: atomically re-tag one or more already-published Docker images.
+#
+# Use this to promote images from one tag to another (e.g., a SHA tag → a release
+# tag) without rebuilding.  All specified targets must be verified before any new
+# tag is applied, giving an all-or-nothing atomicity guarantee.
+#
+# Features
+# --------
+# - Verifies every source image exists before creating any new tag.
+# - Atomically re-tags all targets: if any verification fails, no tag is created.
+# - Works with any OCI-compatible registry; defaults to GHCR (ghcr.io).
+# - Compatible with the image layout produced by docker-build-push.yml.
+#
+# Usage example (single-stage image)
+# ------------------------------------
+# jobs:
+#   release:
+#     uses: federico-busetti-io/.github/.github/workflows/docker-retag.yml@main
+#     with:
+#       image-name: ${{ github.repository }}
+#       source-tag: sha-abc1234
+#       destination-tag: v1.2.3
+#     permissions:
+#       contents: read
+#       packages: write
+#
+# Usage example (multistage – all targets re-tagged atomically)
+# --------------------------------------------------------------
+# jobs:
+#   release:
+#     uses: federico-busetti-io/.github/.github/workflows/docker-retag.yml@main
+#     with:
+#       image-name: ${{ github.repository }}
+#       targets: '["base", "app"]'
+#       source-tag: sha-abc1234
+#       destination-tag: v1.2.3
+#     permissions:
+#       contents: read
+#       packages: write
+
+name: Docker Retag
+
+on:
+  workflow_call:
+    inputs:
+      registry:
+        description: Container registry where the images are stored.
+        type: string
+        default: ghcr.io
+
+      image-name:
+        description: >
+          Docker image name without the registry prefix (e.g. owner/myapp).
+          For multi-target images each target is expected at
+          {registry}/{image-name}/{target}:{source-tag}.
+        type: string
+        required: true
+
+      targets:
+        description: >
+          JSON array of Dockerfile target names to re-tag atomically.
+          All listed targets must exist under source-tag before any new tag is created.
+          Use [""] (the default) for a single-stage image with no target sub-path.
+          Example: '["base", "app"]'
+        type: string
+        default: '[""]'
+
+      source-tag:
+        description: Existing tag to copy from (e.g. sha-abc1234).
+        type: string
+        required: true
+
+      destination-tag:
+        description: New tag to create (e.g. v1.2.3).
+        type: string
+        required: true
+
+      registry-username:
+        description: >
+          Username for the container registry.
+          Defaults to github.actor when left empty (suitable for GHCR).
+        type: string
+        default: ""
+
+    secrets:
+      registry-password:
+        description: >
+          Password or token for the container registry.
+          Defaults to the built-in GITHUB_TOKEN when not provided (suitable for GHCR).
+          The calling workflow must grant packages: write permission for GHCR pushes.
+        required: false
+
+# ---------------------------------------------------------------------------
+# Jobs
+# ---------------------------------------------------------------------------
+# Two-phase pattern for atomic re-tagging:
+#
+#   verify  – matrix over every target; uses `docker buildx imagetools inspect`
+#             to confirm each source image exists.  Fails fast: if any source
+#             image is missing, the retag job never runs.
+#
+#   retag   – runs only when ALL verify jobs have succeeded; matrix over the
+#             same targets; calls `docker buildx imagetools create` to create
+#             the new tag pointing at the existing manifest (no rebuild).
+# ---------------------------------------------------------------------------
+jobs:
+  # --------------------------------------------------------------------------
+  # Phase 1 – Verify every source image exists.
+  # --------------------------------------------------------------------------
+  verify:
+    name: Verify / ${{ matrix.target || 'default' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: true
+      matrix:
+        target: ${{ fromJSON(inputs.targets) }}
+
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ${{ inputs.registry }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ inputs.registry-username || github.actor }}
+          password: ${{ secrets.registry-password || github.token }}
+
+      # Resolve the source image reference for this target.
+      - name: Compute source image reference
+        id: image-ref
+        run: |
+          target="${{ matrix.target }}"
+          if [ -n "$target" ]; then
+            echo "ref=${{ inputs.registry }}/${{ inputs.image-name }}/${target}:${{ inputs.source-tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${{ inputs.registry }}/${{ inputs.image-name }}:${{ inputs.source-tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Fail this job (and therefore the entire matrix) if the image is missing.
+      - name: Verify source image exists
+        run: docker buildx imagetools inspect "${{ steps.image-ref.outputs.ref }}"
+
+  # --------------------------------------------------------------------------
+  # Phase 2 – Re-tag every target.  Only runs when ALL verify jobs succeeded,
+  # which gives the "all-or-nothing" atomicity guarantee.
+  # --------------------------------------------------------------------------
+  retag:
+    name: Retag / ${{ matrix.target || 'default' }}
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: true
+      matrix:
+        target: ${{ fromJSON(inputs.targets) }}
+
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ${{ inputs.registry }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ inputs.registry-username || github.actor }}
+          password: ${{ secrets.registry-password || github.token }}
+
+      # Resolve both the source and destination image references.
+      - name: Compute image references
+        id: image-ref
+        run: |
+          target="${{ matrix.target }}"
+          if [ -n "$target" ]; then
+            base="${{ inputs.registry }}/${{ inputs.image-name }}/${target}"
+          else
+            base="${{ inputs.registry }}/${{ inputs.image-name }}"
+          fi
+          echo "source=${base}:${{ inputs.source-tag }}" >> "$GITHUB_OUTPUT"
+          echo "dest=${base}:${{ inputs.destination-tag }}" >> "$GITHUB_OUTPUT"
+
+      # Create the new tag by pointing it at the existing manifest.
+      # This is a pure metadata operation — no layers are re-downloaded or rebuilt.
+      - name: Re-tag image
+        run: |
+          docker buildx imagetools create \
+            -t "${{ steps.image-ref.outputs.dest }}" \
+            "${{ steps.image-ref.outputs.source }}"

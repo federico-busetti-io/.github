@@ -109,3 +109,94 @@ jobs:
       contents: read
       packages: write
 ```
+
+---
+
+### `docker-retag.yml` – Atomically re-tag published Docker images
+
+Promotes already-published images from one tag to another (e.g., `sha-abc1234` → `v1.2.3`)
+without rebuilding. All specified targets must be verified to exist before any new tag is applied.
+
+**Key features**
+
+| Feature | Detail |
+|---|---|
+| Atomic | All targets are verified first; if any source image is missing, no new tag is created |
+| No rebuild | Uses `docker buildx imagetools create` — a pure metadata operation |
+| Multi-target | Re-tags any number of Dockerfile targets in one call |
+| Defaults | Works with GHCR out of the box (`github.actor` / `GITHUB_TOKEN`) |
+
+#### How it works
+
+1. **`verify` job** (matrix over targets, `fail-fast: true`):  
+   Calls `docker buildx imagetools inspect` on each source image. If any image is missing, the entire matrix is cancelled and no re-tagging happens.
+
+2. **`retag` job** (`needs: verify`, matrix over targets):  
+   Runs only when every verification succeeds. Calls `docker buildx imagetools create` to create the new tag pointing at the existing multi-arch manifest — no layers are downloaded or rebuilt.
+
+#### Inputs
+
+| Name | Required | Default | Description |
+|---|---|---|---|
+| `image-name` | ✅ | — | Image name without registry prefix, e.g. `owner/myapp` |
+| `source-tag` | ✅ | — | Existing tag to copy from, e.g. `sha-abc1234` |
+| `destination-tag` | ✅ | — | New tag to create, e.g. `v1.2.3` |
+| `targets` | | `[""]` | JSON array of Dockerfile target names. `[""]` for a single-stage image. |
+| `registry` | | `ghcr.io` | Container registry |
+| `registry-username` | | `github.actor` | Registry username |
+
+#### Secrets
+
+| Name | Required | Description |
+|---|---|---|
+| `registry-password` | | Registry password/token. Falls back to `GITHUB_TOKEN` (suitable for GHCR). |
+
+#### Required permissions for the calling workflow
+
+```yaml
+permissions:
+  contents: read
+  packages: write   # needed to create new tags on GHCR
+```
+
+#### Examples
+
+**Single-stage image (triggered on release)**
+
+```yaml
+on:
+  release:
+    types: [published]
+
+jobs:
+  promote:
+    uses: federico-busetti-io/.github/.github/workflows/docker-retag.yml@main
+    with:
+      image-name: ${{ github.repository }}
+      source-tag: sha-abc1234
+      destination-tag: ${{ github.event.release.tag_name }}
+    permissions:
+      contents: read
+      packages: write
+```
+
+**Multistage image (all targets re-tagged atomically)**
+
+```yaml
+on:
+  release:
+    types: [published]
+
+jobs:
+  promote:
+    uses: federico-busetti-io/.github/.github/workflows/docker-retag.yml@main
+    with:
+      image-name: ${{ github.repository }}
+      targets: '["base", "app"]'
+      source-tag: sha-abc1234
+      destination-tag: ${{ github.event.release.tag_name }}
+      # Re-tags ghcr.io/<org>/<repo>/base and ghcr.io/<org>/<repo>/app atomically
+    permissions:
+      contents: read
+      packages: write
+```
