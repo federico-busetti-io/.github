@@ -15,10 +15,23 @@ to a container registry (GHCR by default).
 
 | Feature | Detail |
 |---|---|
-| Multi-arch | `linux/amd64` and `linux/arm64` via QEMU + Docker Buildx |
+| Multi-arch | `linux/amd64` and `linux/arm64` built on **native** GitHub-hosted runners — no QEMU |
 | Atomic multistage | All targets must build before *any* image is pushed |
-| Cache | GHA cache shared between build and push phases |
+| Manifest merge | Per-platform images are pushed by digest and joined into a single multi-arch manifest |
 | Defaults | Works with GHCR out of the box (`github.actor` / `GITHUB_TOKEN`) |
+
+#### How it works
+
+The workflow has two phases:
+
+1. **`build` job** (matrix: `target × platform`, `fail-fast: true`):  
+   Each job runs on the **native** runner for its platform (`ubuntu-latest` for amd64, `ubuntu-24.04-arm` for arm64).  
+   The image is built and pushed to the registry **by digest only** (no tag). If any target fails to build, the entire matrix is cancelled and nothing is ever tagged.
+
+2. **`push` job** (`needs: build`, matrix: `target`):  
+   Runs only when **every** build job succeeds. Downloads all per-platform digests for the target and calls `docker buildx imagetools create` to assemble and push the final multi-arch manifest with the computed tags.
+
+This gives the "all-or-nothing" atomicity guarantee across all targets.
 
 #### Inputs
 
@@ -29,7 +42,7 @@ to a container registry (GHCR by default).
 | `dockerfile` | | `Dockerfile` | Path to the Dockerfile |
 | `context` | | `.` | Docker build context path |
 | `targets` | | `[""]` | JSON array of Dockerfile target names. `[""]` builds the default (final) stage. |
-| `platforms` | | `linux/amd64,linux/arm64` | Comma-separated target platforms |
+| `platforms` | | `["linux/amd64", "linux/arm64"]` | JSON array of target platforms |
 | `tags` | | SHA + `latest` on default branch | Tag rules for `docker/metadata-action` |
 | `registry-username` | | `github.actor` | Registry username |
 
@@ -64,7 +77,8 @@ jobs:
 
 **Multistage image (atomic)**
 
-All targets are built first. Only if every build succeeds are the images pushed.
+All targets are built first on native runners. Only if every build succeeds are the
+multi-arch manifests created and pushed.
 
 ```yaml
 jobs:
