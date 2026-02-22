@@ -1,0 +1,216 @@
+# Reusable workflow: build and push multi-arch Docker images to a container registry.
+#
+# Features
+# --------
+# - Multi-architecture builds (linux/amd64 + linux/arm64) via QEMU and Docker Buildx.
+# - Atomic multistage builds: ALL specified Dockerfile targets must build successfully
+#   before any image is pushed. If one target fails to build, nothing is pushed.
+# - GitHub Actions cache is shared between the build and push phases, so layers are
+#   not downloaded or built twice.
+# - Sane defaults for GHCR (ghcr.io): uses github.actor / github.token automatically.
+#
+# Usage example (single stage)
+# ----------------------------
+# jobs:
+#   publish:
+#     uses: federico-busetti-io/.github/.github/workflows/docker-build-push.yml@main
+#     with:
+#       image-name: ${{ github.repository }}
+#     permissions:
+#       contents: read
+#       packages: write
+#
+# Usage example (multistage – targets pushed atomically)
+# -------------------------------------------------------
+# jobs:
+#   publish:
+#     uses: federico-busetti-io/.github/.github/workflows/docker-build-push.yml@main
+#     with:
+#       image-name: ${{ github.repository }}
+#       targets: '["base", "app"]'
+#     permissions:
+#       contents: read
+#       packages: write
+
+name: Docker Build and Push
+
+on:
+  workflow_call:
+    inputs:
+      registry:
+        description: Container registry to push to.
+        type: string
+        default: ghcr.io
+
+      image-name:
+        description: >
+          Docker image name without the registry prefix (e.g. owner/myapp).
+          For multi-target builds each target is published as {registry}/{image-name}/{target}.
+        type: string
+        required: true
+
+      dockerfile:
+        description: Path to the Dockerfile relative to the repository root.
+        type: string
+        default: Dockerfile
+
+      context:
+        description: Docker build context path.
+        type: string
+        default: .
+
+      targets:
+        description: >
+          JSON array of Dockerfile target names to build and push atomically.
+          All listed targets must build successfully before any image is pushed.
+          Use [""] (the default) to build the final stage without a --target flag.
+          Example: '["base", "app"]'
+        type: string
+        default: '[""]'
+
+      platforms:
+        description: Comma-separated list of target platforms.
+        type: string
+        default: linux/amd64,linux/arm64
+
+      tags:
+        description: >
+          Tag rules passed to docker/metadata-action.
+          Defaults to a short-sha tag plus a "latest" tag on the default branch.
+        type: string
+        default: |
+          type=sha
+          type=raw,value=latest,enable={{is_default_branch}}
+
+      registry-username:
+        description: >
+          Username for the container registry.
+          Defaults to github.actor when left empty (suitable for GHCR).
+        type: string
+        default: ""
+
+    secrets:
+      registry-password:
+        description: >
+          Password or token for the container registry.
+          Defaults to the built-in GITHUB_TOKEN when not provided (suitable for GHCR).
+          The calling workflow must grant packages: write permission for GHCR pushes.
+        required: false
+
+# ---------------------------------------------------------------------------
+# Jobs
+# ---------------------------------------------------------------------------
+# Two-job pattern for atomic multistage support:
+#
+#   build  – matrix over every target; builds all platforms WITHOUT pushing.
+#            Populates the GHA cache. Fails fast: if any target fails to build,
+#            the remaining builds are cancelled and the push job never runs.
+#
+#   push   – runs only when ALL build jobs have succeeded; matrix over the same
+#            targets; rebuilds from GHA cache and pushes to the registry.
+# ---------------------------------------------------------------------------
+jobs:
+  # --------------------------------------------------------------------------
+  # Phase 1 – Build every target (no push).  Fail fast so that a single broken
+  # target cancels the entire matrix and prevents any image from being pushed.
+  # --------------------------------------------------------------------------
+  build:
+    name: Build / ${{ matrix.target || 'default' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: true
+      matrix:
+        target: ${{ fromJSON(inputs.targets) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ${{ inputs.registry }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ inputs.registry-username || github.actor }}
+          password: ${{ secrets.registry-password || github.token }}
+
+      # Build all platforms but do NOT push. The GHA cache is populated here
+      # so that the push job can reuse already-built layers.
+      - name: Build (validate – no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          target: ${{ matrix.target }}
+          platforms: ${{ inputs.platforms }}
+          push: false
+          cache-from: type=gha,scope=docker-${{ matrix.target || 'default' }}
+          cache-to: type=gha,scope=docker-${{ matrix.target || 'default' }},mode=max
+
+  # --------------------------------------------------------------------------
+  # Phase 2 – Push every target.  Only runs when ALL build jobs succeeded,
+  # which gives the "all-or-nothing" atomicity guarantee.
+  # --------------------------------------------------------------------------
+  push:
+    name: Push / ${{ matrix.target || 'default' }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      matrix:
+        target: ${{ fromJSON(inputs.targets) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ${{ inputs.registry }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ inputs.registry-username || github.actor }}
+          password: ${{ secrets.registry-password || github.token }}
+
+      # Derive image tags and OCI labels from Git metadata.
+      # For multi-target builds the image name is {registry}/{image-name}/{target};
+      # for a single (default) stage it is simply {registry}/{image-name}.
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: >-
+            ${{ inputs.registry }}/${{ inputs.image-name }}${{
+              matrix.target != '' && format('/{0}', matrix.target) || ''
+            }}
+          tags: ${{ inputs.tags }}
+
+      # Rebuild from cache and push to the registry.
+      - name: Push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          target: ${{ matrix.target }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=docker-${{ matrix.target || 'default' }}
