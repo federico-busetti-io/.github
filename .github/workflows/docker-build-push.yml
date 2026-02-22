@@ -1,0 +1,271 @@
+# Reusable workflow: build and push multi-arch Docker images to a container registry.
+#
+# Features
+# --------
+# - Multi-architecture builds (linux/amd64 + linux/arm64) on native GitHub-hosted
+#   runners — no QEMU emulation, full native performance.
+# - Atomic multistage builds: ALL specified Dockerfile targets must build successfully
+#   before any image is pushed. If one target fails to build, nothing is pushed.
+# - Sane defaults for GHCR (ghcr.io): uses github.actor / github.token automatically.
+#
+# Usage example (single stage)
+# ----------------------------
+# jobs:
+#   publish:
+#     uses: federico-busetti-io/.github/.github/workflows/docker-build-push.yml@main
+#     with:
+#       image-name: ${{ github.repository }}
+#     permissions:
+#       contents: read
+#       packages: write
+#
+# Usage example (multistage – targets pushed atomically)
+# -------------------------------------------------------
+# jobs:
+#   publish:
+#     uses: federico-busetti-io/.github/.github/workflows/docker-build-push.yml@main
+#     with:
+#       image-name: ${{ github.repository }}
+#       targets: '["base", "app"]'
+#     permissions:
+#       contents: read
+#       packages: write
+
+name: Docker Build and Push
+
+on:
+  workflow_call:
+    inputs:
+      registry:
+        description: Container registry to push to.
+        type: string
+        default: ghcr.io
+
+      image-name:
+        description: >
+          Docker image name without the registry prefix (e.g. owner/myapp).
+          For multi-target builds each target is published as {registry}/{image-name}/{target}.
+        type: string
+        required: true
+
+      dockerfile:
+        description: Path to the Dockerfile relative to the repository root.
+        type: string
+        default: Dockerfile
+
+      context:
+        description: Docker build context path.
+        type: string
+        default: .
+
+      targets:
+        description: >
+          JSON array of Dockerfile target names to build and push atomically.
+          All listed targets must build successfully before any image is pushed.
+          Use [""] (the default) to build the final stage without a --target flag.
+          Example: '["base", "app"]'
+        type: string
+        default: '[""]'
+
+      platforms:
+        description: >
+          JSON array of target platforms. Each platform is built on a native
+          GitHub-hosted runner (linux/amd64 → ubuntu-latest,
+          linux/arm64 → ubuntu-24.04-arm).
+        type: string
+        default: '["linux/amd64", "linux/arm64"]'
+
+      tags:
+        description: >
+          Tag rules passed to docker/metadata-action.
+          Defaults to a short-sha tag plus a "latest" tag on the default branch.
+        type: string
+        default: |
+          type=sha
+          type=raw,value=latest,enable={{is_default_branch}}
+
+      registry-username:
+        description: >
+          Username for the container registry.
+          Defaults to github.actor when left empty (suitable for GHCR).
+        type: string
+        default: ""
+
+    secrets:
+      registry-password:
+        description: >
+          Password or token for the container registry.
+          Defaults to the built-in GITHUB_TOKEN when not provided (suitable for GHCR).
+          The calling workflow must grant packages: write permission for GHCR pushes.
+        required: false
+
+# ---------------------------------------------------------------------------
+# Jobs
+# ---------------------------------------------------------------------------
+# Three-phase pattern for native multi-arch + atomic multistage support:
+#
+#   build  – matrix over every (target × platform); each job runs on the
+#            platform's native runner. Builds and pushes images by digest only
+#            (no tag). Fails fast: a single failing target cancels the entire
+#            matrix so that the push job never runs.
+#
+#   push   – runs only when ALL build jobs have succeeded; matrix over targets;
+#            downloads the per-platform digests and calls
+#            `docker buildx imagetools create` to assemble and push the final
+#            multi-arch manifest. This gives the "all-or-nothing" atomicity
+#            guarantee across targets.
+# ---------------------------------------------------------------------------
+jobs:
+  # --------------------------------------------------------------------------
+  # Phase 1 – Build on native runners, push by digest (no tags yet).
+  # --------------------------------------------------------------------------
+  build:
+    name: Build / ${{ matrix.target || 'default' }} / ${{ matrix.platform }}
+    # Map each platform to its native GitHub-hosted runner.
+    # Supported platforms: linux/amd64 (ubuntu-latest) and linux/arm64 (ubuntu-24.04-arm).
+    # Other platform values will also route to ubuntu-24.04-arm, which is unlikely to be
+    # correct — keep the platforms input to the two supported values.
+    runs-on: ${{ matrix.platform == 'linux/amd64' && 'ubuntu-latest' || 'ubuntu-24.04-arm' }}
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: true
+      matrix:
+        target: ${{ fromJSON(inputs.targets) }}
+        platform: ${{ fromJSON(inputs.platforms) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ${{ inputs.registry }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ inputs.registry-username || github.actor }}
+          password: ${{ secrets.registry-password || github.token }}
+
+      # Compute the image reference (with or without a target sub-path).
+      - name: Compute image reference
+        id: image-ref
+        run: |
+          target="${{ matrix.target }}"
+          if [ -n "$target" ]; then
+            echo "ref=${{ inputs.registry }}/${{ inputs.image-name }}/${target}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${{ inputs.registry }}/${{ inputs.image-name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Build for this single platform on a native runner and push by digest.
+      # No tag is created here; the multi-arch manifest is assembled in the
+      # push job once every platform build has succeeded.
+      # outputs breakdown:
+      #   type=image            – produce an image (not a local tar/dir)
+      #   name=…                – image repository in the registry
+      #   push-by-digest=true   – push without a tag; only the content digest is created
+      #   name-canonical=true   – use the full canonical name so the digest is retrievable
+      #   push=true             – actually push to the registry
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          target: ${{ matrix.target }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ steps.image-ref.outputs.ref }},push-by-digest=true,name-canonical=true,push=true
+
+      # Store the digest as a file so it can be uploaded as an artifact.
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      # Artifact name encodes both target and platform for later retrieval.
+      # Slashes in the platform name are replaced with dashes so the name is
+      # a valid artifact identifier (e.g. linux/amd64 → linux-amd64).
+      - name: Compute artifact name
+        id: artifact-name
+        run: |
+          target="${{ matrix.target }}"
+          platform="${{ matrix.platform }}"
+          echo "name=digest-${target:-default}-${platform//\//-}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact-name.outputs.name }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # --------------------------------------------------------------------------
+  # Phase 2 – Assemble multi-arch manifests and push tagged images.
+  # Runs only when ALL build jobs have succeeded (atomicity guarantee).
+  # --------------------------------------------------------------------------
+  push:
+    name: Push / ${{ matrix.target || 'default' }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      matrix:
+        target: ${{ fromJSON(inputs.targets) }}
+
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ${{ inputs.registry }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ inputs.registry-username || github.actor }}
+          password: ${{ secrets.registry-password || github.token }}
+
+      # Download all per-platform digests for this target.
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digest-${{ matrix.target || 'default' }}-*
+          merge-multiple: true
+          path: /tmp/digests
+
+      # Compute the image reference (with or without a target sub-path).
+      - name: Compute image reference
+        id: image-ref
+        run: |
+          target="${{ matrix.target }}"
+          if [ -n "$target" ]; then
+            echo "ref=${{ inputs.registry }}/${{ inputs.image-name }}/${target}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${{ inputs.registry }}/${{ inputs.image-name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Derive image tags and OCI labels from Git metadata.
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image-ref.outputs.ref }}
+          tags: ${{ inputs.tags }}
+
+      # Merge all platform-specific digests into a single multi-arch manifest
+      # and push it with the computed tags.
+      # The glob [0-9a-f]* matches only valid hex-digest filenames written by
+      # the build job, so stray files in /tmp/digests are safely ignored.
+      - name: Create and push multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ steps.image-ref.outputs.ref }}@sha256:%s ' [0-9a-f]*)
