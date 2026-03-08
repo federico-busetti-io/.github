@@ -161,6 +161,16 @@ jobs:
             echo "ref=${{ inputs.registry }}/${{ inputs.image-name }}" >> "$GITHUB_OUTPUT"
           fi
 
+      # Compute a per-target, per-platform cache ref stored in the same registry.
+      # Slashes in the platform name are replaced with dashes for a valid tag
+      # (e.g. linux/amd64 → linux-amd64).
+      - name: Compute cache ref
+        id: cache-ref
+        run: |
+          target="${{ matrix.target }}"
+          platform="${{ matrix.platform }}"
+          echo "ref=${{ inputs.registry }}/${{ inputs.image-name }}/cache:${target:-default}-${platform//\//-}" >> "$GITHUB_OUTPUT"
+
       # Build for this single platform on a native runner and push by digest.
       # No tag is created here; the multi-arch manifest is assembled in the
       # push job once every platform build has succeeded.
@@ -179,6 +189,8 @@ jobs:
           target: ${{ matrix.target }}
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ steps.image-ref.outputs.ref }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=registry,ref=${{ steps.cache-ref.outputs.ref }}
+          cache-to: type=registry,ref=${{ steps.cache-ref.outputs.ref }},mode=max
 
       # Store the digest as a file so it can be uploaded as an artifact.
       - name: Export digest
