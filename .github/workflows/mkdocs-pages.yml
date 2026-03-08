@@ -1,0 +1,95 @@
+# Reusable workflow: build MkDocs documentation and deploy to GitHub Pages.
+#
+# Usage example
+# -------------
+# jobs:
+#   pages:
+#     uses: federico-busetti-io/.github/.github/workflows/mkdocs-pages.yml@main
+#     with:
+#       python-version: "3.14"
+#     permissions:
+#       contents: read
+#       pages: write
+#       id-token: write
+
+name: Deploy MkDocs to GitHub Pages
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: Python version used to build the documentation.
+        type: string
+        default: "3.14"
+
+      build-command:
+        description: Shell command that builds the static site (must produce output in site-path).
+        type: string
+        default: make docs-build
+
+      site-path:
+        description: Path to the built static site directory, relative to the repository root.
+        type: string
+        default: ./site
+
+# Allow only one concurrent deployment, skipping runs queued between the run
+# in-progress and latest queued. Do NOT cancel in-progress runs so that
+# production deployments are allowed to complete.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    permissions:
+      contents: read
+
+    environment:
+      name: github-pages
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ inputs.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: make dev-dependencies
+
+      - name: Build static pages
+        run: ${{ inputs.build-command }}
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ inputs.site-path }}
+
+  deploy:
+    needs: build
+
+    # Grant GITHUB_TOKEN the permissions required to make a Pages deployment.
+    permissions:
+      pages: write      # to deploy to Pages
+      id-token: write   # to verify the deployment originates from an appropriate source
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
